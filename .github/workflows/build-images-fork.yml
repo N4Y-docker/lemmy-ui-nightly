@@ -1,0 +1,231 @@
+name: Build Container Images
+
+on:
+  push:
+    branches:
+      - test
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      contents: read
+
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
+      annotations: ${{ steps.meta.outputs.annotations }}
+      json: ${{ steps.meta.outputs.json }}
+      image-name: ${{ steps.custom-meta.outputs.image-name }}
+      tag-name: ${{ steps.custom-meta.outputs.tag-name }}
+      extra-commits: ${{ steps.check-extra-commits.outputs.commit-count }}
+
+    steps:
+      - name: Checkout current fork HEAD
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          show-progress: false
+
+#      - name: Set up upstream git remote
+#        run: |
+#          upstream="$(gh repo view "${{ github.repository }}" --json parent --jq '.parent.owner.login + "/" + .parent.name')"
+#          echo "upstream=$upstream"
+#          git remote add upstream "https://github.com/$upstream.git"
+#          git fetch upstream "${{ github.event.repository.default_branch }}"
+#        env:
+#          GH_TOKEN: ${{ github.token }}
+
+      - name: Determine number of commits on top of upstream
+        id: check-extra-commits
+        run: |
+          commit_count=0 # "$(git rev-list --count "upstream/${{ github.event.repository.default_branch }}..$GITHUB_REF_NAME")"
+          echo "commit-count=$commit_count" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Discard our commits
+        run: |
+          git reset --hard "HEAD~${{ steps.check-extra-commits.outputs.commit-count }}"
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          context: git
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=long
+            type=sha,format=short
+
+      - name: Extract image name
+        id: custom-meta
+        run: |
+          eval "tags=($(jq -r '.tags | map("--tag", .) | @sh' <<< "$DOCKER_METADATA_OUTPUT_JSON"))"
+          eval "annotations=($(jq -r '.annotations | map("--annotation", .) | @sh' <<< "$DOCKER_METADATA_OUTPUT_JSON"))"
+
+          echo docker buildx imagetools create \
+            "${tags[@]}" "${annotations[@]}" \
+            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
+
+          exit 1
+
+          echo "image-name=${DOCKER_TAG%%:*}" | tee -a "$GITHUB_OUTPUT"
+          echo "tag-name=${DOCKER_TAG##*:}" | tee -a "$GITHUB_OUTPUT"
+        env:
+          DOCKER_TAG: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+
+  build:
+    runs-on: ubuntu-24.04${{ matrix.platform == 'linux/arm64' && '-arm' || '' }}
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      packages: write
+
+    needs:
+      - meta
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+
+    env:
+      REGISTRY_IMAGE: ${{ needs.meta.outputs.image-name }}
+
+    steps:
+      - name: Prepare
+        id: meta
+        run: |
+          platform=${{ matrix.platform }}
+          echo "platform-pair=${platform//\//-}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # We can't build directly from git context, as that will prevent .git from being available during the build process.
+      # lemmy-ui's Dockerfile requires the .git folder to set the version.
+      - name: Checkout git repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          show-progress: false
+          submodules: recursive
+
+      - name: Discard our commits
+        run: |
+          git reset --hard "HEAD~${{ needs.meta.outputs.extra-commits }}"
+
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ needs.meta.outputs.labels }}
+          annotations: ${{ needs.meta.outputs.annotations }}
+          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+        env:
+          SOURCE_DATE_EPOCH: 0
+
+      - name: Export image digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ steps.meta.outputs.platform-pair }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      contents: read
+      packages: write
+
+    needs:
+      - meta
+      - build
+
+    env:
+      REGISTRY_IMAGE: ${{ needs.meta.outputs.image-name }}
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          echo docker buildx imagetools create \
+            $(jq -r '.tags | map("-t", .) | @sh' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(jq -r '.annotations | map("--annotation", .) | @sh' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ needs.meta.outputs.json }}
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ needs.meta.outputs.tag-name }}
+
+  notify_failure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    needs:
+      - meta
+      - build
+      - merge
+
+    # if: ${{ always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+
+    steps:
+      - name: Notify about CI failure
+        run: >-
+          curl
+          -s -o /dev/null
+          -H "Title: ${{ github.repository }} workflow failed"
+          -H "Content-Type: text/plain"
+          -d $'Repo: ${{ github.repository }}\nWorkflow: ${{ github.workflow }}\nCommit: ${{ github.sha }}\nRef: ${{ github.ref }}\nURL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          "$NTFY_URL"
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
